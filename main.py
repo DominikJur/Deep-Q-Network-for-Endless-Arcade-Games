@@ -7,14 +7,13 @@ import numpy as np
 import time
 warnings.filterwarnings("ignore")
 
-train = True
+train = False
 if train:
     env = gym.make("LunarLander-v3")
 
     replay_buffer = PrioritizedExperienceReplayBuffer(capacity=10000)
-    q_network = train_ddqn(env, replay_buffer, num_episodes=500, gamma=0.99)
+    q_network = train_ddqn(env, replay_buffer, num_episodes=5000, gamma=0.99)
 
-    # save network state dict (will be loaded to the correct device on eval)
     save_network(q_network, "lunar_lander_dqn.pth")
 
     env.close()

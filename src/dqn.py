@@ -9,6 +9,32 @@ import numpy as np
 # choose device early so all tensors/networks can be moved there
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# enable cuDNN autotuner for fixed-size inputs to pick fast algorithms
+torch.backends.cudnn.benchmark = True
+
+# Network & Learning
+learning_rate = 5e-4       
+gamma = 0.99                
+tau = 0.005                 
+batch_size = 64             
+
+# Replay Buffer
+buffer_capacity = 100000    
+alpha = 0.6                 
+beta_start = 0.4           
+beta_frames = 100000       
+
+# Exploration (epsilon-greedy)
+epsilon_start = 1.0        
+epsilon_end = 0.01         
+epsilon_decay = 30000      
+
+# Training
+num_episodes = 1000        
+min_buffer_size = 1000     
+
+# Weight decay in optimizer
+weight_decay = 0           # Often better to disable for RL
 
 class DeepQNetwork(nn.Module):
     def __init__(self, input_dim, output_dim):
@@ -27,7 +53,7 @@ class DeepQNetwork(nn.Module):
         return x
 
 class PrioritizedExperienceReplayBuffer:
-    def __init__(self, capacity, alpha=0.6, beta=0.4, beta_increment_per_sampling=0.001, epsilon=1e-6):
+    def __init__(self, capacity, alpha=alpha, beta=beta_start, beta_increment_per_sampling=(1.0 - beta_start) / beta_frames, epsilon=1e-6):
         self.memory = deque(maxlen=capacity)
         self.alpha = alpha
         self.beta = beta
@@ -41,10 +67,6 @@ class PrioritizedExperienceReplayBuffer:
         self.priorities.append(max_priority)
 
     def sample(self, batch_size):
-        batch = random.sample(self.memory, batch_size)
-
-
-
         probabilities = np.array(self.priorities) ** self.alpha
         probabilities /= probabilities.sum()
         indices = np.random.choice(len(self.memory), size=batch_size, p=probabilities)
@@ -98,7 +120,11 @@ def describe_episode(episode, episode_reward, steps):
     print(f"Episode {episode}: Total Reward: {episode_reward}, Steps: {steps}")
 
 
-def train_ddqn(env, replay_buffer, num_episodes, gamma, batch_size=32, tau=0.01, learning_rate=1e-3):
+def train_ddqn(env, replay_buffer=None, num_episodes=num_episodes, gamma=gamma, batch_size=batch_size, tau=tau, learning_rate=learning_rate):
+    # create default replay buffer if none supplied, using top-level hyperparameters
+    if replay_buffer is None:
+        replay_buffer = PrioritizedExperienceReplayBuffer(buffer_capacity, alpha=alpha, beta=beta_start, beta_increment_per_sampling=(1.0 - beta_start) / beta_frames)
+
     online_network = create_network(env.observation_space.shape[0], env.action_space.n)
     target_network = create_network(env.observation_space.shape[0], env.action_space.n)
     target_network.load_state_dict(online_network.state_dict())
@@ -108,9 +134,10 @@ def train_ddqn(env, replay_buffer, num_episodes, gamma, batch_size=32, tau=0.01,
     print("Training DDQN with Prioritized Experience Replay using device:", device)
     print("===============================================")
     
-    replay_buffer.increment_beta()
+    # start beta annealing from beta_start (replay buffer already initialized accordingly)
     last_100_rewards = deque(maxlen=100)
-    optimizer = optim.AdamW(online_network.parameters(), lr=learning_rate, weight_decay=1e-5)
+    global_step = 0
+    optimizer = optim.AdamW(online_network.parameters(), lr=learning_rate, weight_decay=weight_decay)
     for episode in range(num_episodes):
         state, _ = env.reset()
         done = False
@@ -118,21 +145,26 @@ def train_ddqn(env, replay_buffer, num_episodes, gamma, batch_size=32, tau=0.01,
         episode_reward = 0
         while not done:
             # make sure the observation tensor is on the correct device
-            q_values = online_network(torch.tensor(state, dtype=torch.float32, device=device))
-            action = select_action(q_values, step, 0.9, 0.05, 500)
+            # run single-step inference without gradient tracking to avoid autograd overhead
+            state_tensor = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+            with torch.no_grad():
+                q_values = online_network(state_tensor).squeeze(0)
+            # use global epsilon schedule from top-of-file params
+            action = select_action(q_values, global_step, epsilon_start, epsilon_end, epsilon_decay)
             next_state, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
             episode_reward += reward
             replay_buffer.push(state, action, reward, next_state, done)
             
-            if len(replay_buffer) < batch_size:
+            # wait until a minimum number of transitions collected before training
+            if len(replay_buffer) < min_buffer_size:
                 state = next_state
                 continue
 
             states, actions, rewards, next_states, dones, weights, indices = replay_buffer.sample(batch_size)
-            # move sampled data to the device
-            states = torch.stack([torch.tensor(s, dtype=torch.float32, device=device) for s in states])
-            next_states = torch.stack([torch.tensor(s, dtype=torch.float32, device=device) for s in next_states])
+            # move sampled data to the device in one bulk tensor allocation (fewer small copies)
+            states = torch.tensor(np.array(states), dtype=torch.float32, device=device)
+            next_states = torch.tensor(np.array(next_states), dtype=torch.float32, device=device)
             actions = torch.tensor(actions, dtype=torch.long, device=device).unsqueeze(1)
             rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
             dones = torch.tensor(dones, dtype=torch.float32, device=device)
@@ -157,8 +189,11 @@ def train_ddqn(env, replay_buffer, num_episodes, gamma, batch_size=32, tau=0.01,
             optimizer.step()
             
             update_target_network(target_network, online_network, tau)
+            # increment beta annealing per training step
+            replay_buffer.increment_beta()
             state = next_state
             step += 1
+            global_step += 1
         
         describe_episode(episode, episode_reward, step)
 
@@ -166,4 +201,6 @@ def train_ddqn(env, replay_buffer, num_episodes, gamma, batch_size=32, tau=0.01,
         if episode % 100 == 0:
             save_network(online_network, f"lunar_lander_dqn_{episode}.pth")
             print(f"Average reward over last 100 episodes: {np.mean(last_100_rewards)}")
+            epsilon = epsilon_end + (epsilon_start - epsilon_end) * math.exp(-global_step/epsilon_decay)
+            print(f"Updated epsilon: {epsilon}")
     return online_network
