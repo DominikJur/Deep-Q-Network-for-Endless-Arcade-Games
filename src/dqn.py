@@ -16,7 +16,8 @@ torch.backends.cudnn.benchmark = True
 learning_rate = 5e-4       
 gamma = 0.99                
 tau = 0.005                 
-batch_size = 64             
+batch_size = 64    
+num_episodes = 2500         
 
 # Replay Buffer
 buffer_capacity = 100000    
@@ -26,8 +27,8 @@ beta_frames = 100000
 
 # Exploration (epsilon-greedy)
 epsilon_start = 1.0        
-epsilon_end = 0.01         
-epsilon_decay = 30000      
+epsilon_end = 0.05         
+epsilon_decay = 25_000      
 
 # Training
 num_episodes = 1000        
@@ -70,10 +71,9 @@ class PrioritizedExperienceReplayBuffer:
         probabilities = np.array(self.priorities) ** self.alpha
         probabilities /= probabilities.sum()
         indices = np.random.choice(len(self.memory), size=batch_size, p=probabilities)
-        
-        weights = (len(self.memory) * probabilities) ** (self.beta)
-        weights /= np.max(weights)
-        weights = [weights[idx] for idx in indices]
+
+        weights = (len(self.memory) * probabilities[indices]) ** (-self.beta)  
+        weights /= weights.max()
         batch = [self.memory[idx] for idx in indices]
         
         states, actions, rewards, next_states, dones = zip(*batch)
@@ -120,10 +120,7 @@ def describe_episode(episode, episode_reward, steps):
     print(f"Episode {episode}: Total Reward: {episode_reward}, Steps: {steps}")
 
 
-def train_ddqn(env, replay_buffer=None, num_episodes=num_episodes, gamma=gamma, batch_size=batch_size, tau=tau, learning_rate=learning_rate):
-    # create default replay buffer if none supplied, using top-level hyperparameters
-    if replay_buffer is None:
-        replay_buffer = PrioritizedExperienceReplayBuffer(buffer_capacity, alpha=alpha, beta=beta_start, beta_increment_per_sampling=(1.0 - beta_start) / beta_frames)
+def train_ddqn(env, replay_buffer, num_episodes=num_episodes, gamma=gamma, batch_size=batch_size, tau=tau, learning_rate=learning_rate):
 
     online_network = create_network(env.observation_space.shape[0], env.action_space.n)
     target_network = create_network(env.observation_space.shape[0], env.action_space.n)
@@ -200,7 +197,9 @@ def train_ddqn(env, replay_buffer=None, num_episodes=num_episodes, gamma=gamma, 
         last_100_rewards.append(episode_reward)
         if episode % 100 == 0:
             save_network(online_network, f"lunar_lander_dqn_{episode}.pth")
-            print(f"Average reward over last 100 episodes: {np.mean(last_100_rewards)}")
+            print(f"\nAverage reward over last 100 episodes: {np.mean(last_100_rewards)}")
+            print(f"Global step: {global_step}")
+            print(f"Updated beta: {replay_buffer.beta}")
             epsilon = epsilon_end + (epsilon_start - epsilon_end) * math.exp(-global_step/epsilon_decay)
-            print(f"Updated epsilon: {epsilon}")
+            print(f"Updated epsilon: {epsilon}\n")
     return online_network
